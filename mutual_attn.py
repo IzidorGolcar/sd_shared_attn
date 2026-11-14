@@ -1,16 +1,19 @@
-from typing import Optional, Tuple, Dict
+from typing import Callable, Optional, Tuple, Dict
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageFilter
 from diffusers import (
-    ControlNetModel,
-    StableDiffusionControlNetInpaintPipeline,
+    StableDiffusionInpaintPipeline,
     DDIMScheduler,
     DDIMInverseScheduler,
 )
 from diffusers.models.attention_processor import AttnProcessor2_0
+
+
+def _constant_style_fidelity(step: int, num_steps: int) -> float:
+    return 0.5
 
 
 class MasaCtrlInpaintAttnProcessor(AttnProcessor2_0):
@@ -203,32 +206,24 @@ class MasaCtrlInpaintAttnProcessor(AttnProcessor2_0):
         )
 
 
-class MasaCtrlDepthInpainter:
+class MasaCtrlInpainter:
     '''
     Two-phase zero-shot SD 1.5 Inpainting pipeline:
-      Phase 1 (steps 0 .. switch_step - 1): Depth ControlNet + text prompt layout generation.
-      Phase 2 (steps switch_step .. N - 1): ControlNet disabled; MasaCtrl mask-guided mutual
-                                            self-attention transfers reference region M_s -> M.
+      Phase 1 (steps 0 .. switch_step - 1): text prompt layout generation.
+      Phase 2 (steps switch_step .. N - 1): MasaCtrl mask-guided mutual self-attention
+                                            transfers reference region M_s -> M.
     '''
     def __init__(
         self,
-        inpaint_model_id: str = 'sd-legacy/stable-diffusion-inpainting',
-        controlnet_model_id: str = 'lllyasviel/control_v11p_sd15_softedge',
+        inpaint_model_id: str = 'sd-legacy/stable-diffusion-inpainting', # should use sd-legacy/stable-diffusion-v1-5
         device: str = 'cuda',
         hook_blocks: Tuple[str, ...] = ('up_blocks',),  # Decoder layers per MasaCtrl Sec. 4.1 & Fig. 12(b)
     ):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.dtype = torch.float16 if self.device.type == 'cuda' else torch.float32
 
-        self.controlnet = ControlNetModel.from_pretrained(
-            controlnet_model_id,
-            torch_dtype=self.dtype,
-            use_safetensors=True,
-        )
-
-        self.pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
+        self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
             inpaint_model_id,
-            controlnet=self.controlnet,
             torch_dtype=self.dtype,
             use_safetensors=False,
             safety_checker=None,
@@ -304,31 +299,25 @@ class MasaCtrlDepthInpainter:
         self,
         init_image: Image.Image,
         inpaint_mask: Image.Image,
-        depth_map: Image.Image,
         reference_image: Image.Image,
         reference_mask: Image.Image,
-        prompt: str = 'extreme macro closeup photograph of a single human finger covering an eye, sharp edges, shadows',
+        prompt: str = 'extreme macro closeup photograph of a single human finger, shadows',
         negative_prompt: str = '',
         width: int = 512,
         height: int = 512,
         num_inference_steps: int = 30,
         switch_step: int = 6,
         guidance_scale: float = 6.5,
-        controlnet_conditioning_scale: float = 0.0,
-        depth_blur_radius: float = 0.0,
-        style_fidelity: float = 0.2,
+        style_fidelity: Callable[[int, int], float] = _constant_style_fidelity,
         crop_to_ref_mask: bool = True,
         seed: int = 42,
     ) -> Image.Image:
         self.state['bank'].clear()
-        self.state['style_fidelity'] = style_fidelity
+        self.state['style_fidelity'] = 0.5
 
         # 1. Align inputs
         init_img = init_image.convert('RGB').resize((width, height), Image.LANCZOS)
         tgt_mask_img = inpaint_mask.convert('L').resize((width, height), Image.NEAREST)
-        depth_img = depth_map.convert('RGB').resize((width, height), Image.LANCZOS)
-        if depth_blur_radius > 0.0:
-            depth_img = depth_img.filter(ImageFilter.GaussianBlur(radius=depth_blur_radius))
 
         ref_rgb = reference_image.convert('RGB')
         ref_mask_l = reference_mask.convert('L').resize(ref_rgb.size, Image.NEAREST)
@@ -382,13 +371,21 @@ class MasaCtrlDepthInpainter:
         self.pipe.scheduler.set_timesteps(num_inference_steps, device=self.device)
         timesteps = self.pipe.scheduler.timesteps
 
+        def get_style_fidelity(step_idx: int) -> float:
+            fidelity = style_fidelity(step_idx, len(timesteps))
+            if not 0.0 <= fidelity <= 1.0:
+                raise ValueError('style_fidelity must return a value between 0.0 and 1.0')
+            return fidelity
+
         def arm_step(step_idx: int) -> None:
-            # Phase 1: Pure ControlNet + text prompt layout synthesis
+            # Phase 1: text prompt layout synthesis
             if step_idx < switch_step or step_idx >= len(timesteps):
                 self.state['mode'] = 'noop'
                 return
 
-            # Phase 2: ControlNet disabled; extract K_s, V_s from inverted trajectory and activate read mode
+            self.state['style_fidelity'] = get_style_fidelity(step_idx)
+
+            # Phase 2: extract K_s, V_s from inverted trajectory and activate read mode
             t = timesteps[step_idx]
             nearest_t = min(ref_trajectory.keys(), key=lambda k: abs(k - int(t.item())))
             z_ref_t = ref_trajectory[nearest_t]
@@ -410,9 +407,6 @@ class MasaCtrlDepthInpainter:
             arm_step(step_index + 1)
             return callback_kwargs
 
-        # Phase 1 runs ControlNet up to switch_step, then disables ControlNet completely for Phase 2
-        control_guidance_end = max(0.0, min(1.0, switch_step / float(num_inference_steps)))
-
         try:
             gen = torch.Generator(device=self.device).manual_seed(seed)
             result = self.pipe(
@@ -420,9 +414,6 @@ class MasaCtrlDepthInpainter:
                 negative_prompt=negative_prompt,
                 image=init_img,
                 mask_image=tgt_mask_img,
-                control_image=depth_img,
-                controlnet_conditioning_scale=controlnet_conditioning_scale,
-                control_guidance_end=control_guidance_end,
                 width=width,
                 height=height,
                 num_inference_steps=num_inference_steps,
@@ -438,29 +429,43 @@ class MasaCtrlDepthInpainter:
 
 
 if __name__ == '__main__':
-    inpainter = MasaCtrlDepthInpainter(device='cuda')
+    inpainter = MasaCtrlInpainter(device='cuda')
 
     init_img = Image.open('assets/src.jpg')
-    inpaint_msk = Image.open('assets/mask.jpg')
-    depth_img = Image.open('assets/edges.jpg')
+    inpaint_msk = Image.open('assets/mask_rect.jpg')
     ref_img = Image.open('references/1.jpeg')
     ref_msk = Image.open('references/1_mask.png')
 
     inpaint_msk = inpaint_msk.filter(ImageFilter.MaxFilter(25))
+    inpaint_msk = inpaint_msk.filter(ImageFilter.GaussianBlur(45))
+
+    import matplotlib.pyplot as plt
+
+
+    def fidelity_func(s, n):
+        if s < n / 3:
+            return 0.0
+        # if s < n / 5:
+        #     return 0.0
+        # return np.random.uniform(0.0, 1.0)
+        return np.linspace(0.8, 0.0, n)[s]
+        # return np.arange(0.0, 0.7, 0.7 / n)[s]
+        # return min([1.0, max([0.0, np.random.normal(loc=0.5, scale=0.4)])])
 
     output = inpainter.generate(
         init_image=init_img,
         inpaint_mask=inpaint_msk,
-        depth_map=depth_img,
         reference_image=ref_img,
         reference_mask=ref_msk,
         num_inference_steps=40,
-        switch_step=15,
-        seed=41,
+        switch_step=5,
+        seed=1,
+        style_fidelity=fidelity_func,
+        guidance_scale=6,
+        # prompt='',
         crop_to_ref_mask=False
     )
     output.save('output_masactrl_two_phase_sd15.png')
-    import matplotlib.pyplot as plt
     plt.imshow(output)
     plt.axis('off')
     plt.tight_layout()
