@@ -16,6 +16,11 @@ def _default_style_fidelity(step: int, num_steps: int) -> float:
     return 0.5
 
 
+def _default_bg_suppress_bias(step: int, num_steps: int) -> float:
+    # Strong structural isolation early, relaxing to soft boundary blending (-2.5) late
+    return float(np.linspace(-12.0, -2.5, num_steps)[step])
+
+
 def _mask_centroid(mask_l: Image.Image) -> Tuple[float, float]:
     arr = np.array(mask_l, dtype=np.uint8) > 127
     ys, xs = np.where(arr)
@@ -115,16 +120,15 @@ def compact_foreground_tokens(
     return compacted, valid_mask
 
 
-def _build_spatial_isolation_bias(
+def _build_unit_isolation_weights(
     mask_2d: torch.Tensor,
     seq_len: int,
-    bg_suppress_bias: float,
     dtype: torch.dtype,
     device: torch.device,
 ) -> Optional[torch.Tensor]:
     '''
-    Builds a [B, 1, seq_len, seq_len] attention bias suppressing foreground queries
-    (inside mask) from attending to background keys (outside mask).
+    Builds a [B, 1, seq_len, seq_len] weight matrix m_i * (1 - m_j) in [0, 1]
+    representing foreground-query to background-key suppression strength.
     '''
     b_mask, _, h_full, w_full = mask_2d.shape
     aspect = w_full / float(h_full)
@@ -132,16 +136,13 @@ def _build_spatial_isolation_bias(
     w_feat = max(1, seq_len // h_feat)
 
     mask_down = F.interpolate(mask_2d.float(), size=(h_feat, w_feat), mode='bilinear', align_corners=False)
-    fg_flat = (mask_down > 0.5).view(b_mask, seq_len)
+    fg = mask_down.clamp(0.0, 1.0).view(b_mask, seq_len)
 
-    # Block foreground queries (row=True) from attending to background keys (col=False)
-    suppress = fg_flat[:, :, None] & (~fg_flat[:, None, :])  # [B, seq_len, seq_len]
-    if not suppress.any():
+    weights = fg[:, :, None] * (1.0 - fg[:, None, :])  # [B, seq_len, seq_len]
+    if not (weights > 1e-4).any():
         return None
 
-    bias_val = torch.tensor(bg_suppress_bias, device=device, dtype=dtype)
-    zero_val = torch.tensor(0.0, device=device, dtype=dtype)
-    return torch.where(suppress, bias_val, zero_val)[:, None, :, :]  # [B, 1, seq_len, seq_len]
+    return weights[:, None, :, :].to(device=device, dtype=dtype)
 
 
 def _get_isolation_bias(
@@ -162,20 +163,20 @@ def _get_isolation_bias(
         write_masks = state_dict.get('write_fg_masks')
         if write_masks is None:
             return None
-        return _build_spatial_isolation_bias(write_masks, seq_len, bg_suppress_bias, dtype, device)
+        unit_weights = _build_unit_isolation_weights(write_masks, seq_len, dtype, device)
+        return None if unit_weights is None else unit_weights * bg_suppress_bias
 
     tgt_mask_2d = state_dict.get('tgt_fg_tensor')
     if tgt_mask_2d is None:
         return None
 
-    cache = state_dict.setdefault('iso_bias_cache', {})
-    cache_key = (seq_len, dtype, bg_suppress_bias)
-    if cache_key in cache:
-        return cache[cache_key]
+    cache = state_dict.setdefault('iso_weight_cache', {})
+    cache_key = (seq_len, dtype)
+    if cache_key not in cache:
+        cache[cache_key] = _build_unit_isolation_weights(tgt_mask_2d, seq_len, dtype, device)
 
-    attn_bias = _build_spatial_isolation_bias(tgt_mask_2d, seq_len, bg_suppress_bias, dtype, device)
-    cache[cache_key] = attn_bias
-    return attn_bias
+    unit_weights = cache[cache_key]
+    return None if unit_weights is None else unit_weights * bg_suppress_bias
 
 
 def _isolated_self_attention(
@@ -186,7 +187,7 @@ def _isolated_self_attention(
 ) -> torch.Tensor:
     '''
     Runs self-attention while suppressing attention from foreground queries (inside mask)
-    to background keys (outside mask) so background textures do not bleed into the object.
+    to background keys (outside mask) according to the current step's bias schedule.
     '''
     residual = hidden_states
     if attn.spatial_norm is not None:
@@ -237,8 +238,8 @@ def _isolated_self_attention(
 
 class BackgroundSuppressedAttnProcessor(AttnProcessor2_0):
     '''
-    Applied to non-MasaCtrl self-attention layers (down_blocks, mid_block) to stop
-    foreground queries from pulling background texture across the mask boundary.
+    Applied to non-MasaCtrl self-attention layers (down_blocks, mid_block) to regulate
+    cross-boundary attention between foreground and surrounding background context.
     '''
     def __init__(self, state_dict: dict):
         super().__init__()
@@ -270,7 +271,7 @@ class BackgroundSuppressedAttnProcessor(AttnProcessor2_0):
 class MultiViewMasaCtrlAttnProcessor(AttnProcessor2_0):
     '''
     Multi-view MasaCtrl attention processor with foreground token compaction,
-    Best-View Routing, and bi-directional background-isolated self-attention.
+    Best-View Routing, and scheduled background-isolated self-attention.
     '''
     def __init__(self, layer_name: str, state_dict: dict):
         super().__init__()
@@ -288,7 +289,7 @@ class MultiViewMasaCtrlAttnProcessor(AttnProcessor2_0):
         w_feat = max(1, seq_len // h_feat)
 
         tgt_down = F.interpolate(tgt_mask_2d, size=(h_feat, w_feat), mode='bilinear', align_corners=False)
-        return (tgt_down > 0.5).to(dtype=dtype).flatten(2).transpose(1, 2)  # [1, seq_len, 1]
+        return tgt_down.clamp(0.0, 1.0).to(dtype=dtype).flatten(2).transpose(1, 2)  # [1, seq_len, 1]
 
     def _select_best_view(
         self,
@@ -458,7 +459,6 @@ class MultiViewMasaCtrlAttnProcessor(AttnProcessor2_0):
                     )
                 return torch.cat([out_uncond, out_cond], dim=0)
 
-        # Phase 1 ('noop'): suppress background -> foreground attention while geometry forms
         return _isolated_self_attention(attn, hidden_states, self.state_dict, temb=temb)
 
 
@@ -468,7 +468,7 @@ class FastMultiViewMasaCtrlInpainter:
       1. Closed-form forward noising q(z_t | z_0) instead of N-view DDIM inversion.
       2. Coarse-to-fine view pruning at switch_step down to top_k_views.
       3. Temporal KV caching across write_stride denoising steps.
-      4. Bi-directional foreground-isolated self-attention on both target and reference views.
+      4. Scheduled bi-directional foreground-isolated self-attention.
     '''
     def __init__(
         self,
@@ -498,7 +498,7 @@ class FastMultiViewMasaCtrlInpainter:
             'tgt_fg_tensor': None,
             'bg_suppress_bias': -10000.0,
             'isolate_reference': True,
-            'iso_bias_cache': {},
+            'iso_weight_cache': {},
             'style_fidelity': 0.5,
             'record_view_scores': False,
             'view_scores': [],
@@ -545,7 +545,7 @@ class FastMultiViewMasaCtrlInpainter:
         reference_image: Union[Image.Image, List[Image.Image]],
         reference_mask: Union[Image.Image, List[Image.Image]],
         attn_mask: Optional[Image.Image] = None,
-        bg_suppress_bias: float = -10000.0,
+        bg_suppress_bias: Union[float, Callable[[int, int], float]] = _default_bg_suppress_bias,
         isolate_reference: bool = True,
         prompt: str = 'extreme macro closeup photograph of a single human finger, shadows',
         negative_prompt: str = '',
@@ -564,9 +564,8 @@ class FastMultiViewMasaCtrlInpainter:
         self.state['bank'].clear()
         self.state['bank_chunks'].clear()
         self.state['view_scores'].clear()
-        self.state['iso_bias_cache'].clear()
+        self.state['iso_weight_cache'].clear()
         self.state['record_view_scores'] = False
-        self.state['bg_suppress_bias'] = float(bg_suppress_bias)
         self.state['isolate_reference'] = bool(isolate_reference)
 
         ref_images = [reference_image] if isinstance(reference_image, Image.Image) else list(reference_image)
@@ -574,7 +573,7 @@ class FastMultiViewMasaCtrlInpainter:
         if len(ref_images) != len(ref_masks) or len(ref_images) == 0:
             raise ValueError('reference_image and reference_mask must be non-empty and have matching lengths')
 
-        # 1. Prepare target image, blending mask, and tight foreground attention mask
+        # 1. Prepare target image, blending mask, and foreground attention mask
         init_img = init_image.convert('RGB').resize((width, height), Image.LANCZOS)
         tgt_mask_arr = np.array(
             inpaint_mask.convert('L').resize((width, height), Image.BILINEAR), dtype=np.float32
@@ -585,10 +584,9 @@ class FastMultiViewMasaCtrlInpainter:
 
         core_mask_src = attn_mask if attn_mask is not None else inpaint_mask
         core_arr = np.array(
-            core_mask_src.convert('L').resize((width, height), Image.NEAREST), dtype=np.float32
-        )
-        tgt_fg = (core_arr > 127.0).astype(np.float32)
-        self.state['tgt_fg_tensor'] = torch.from_numpy(tgt_fg)[None, None].to(
+            core_mask_src.convert('L').resize((width, height), Image.BILINEAR), dtype=np.float32
+        ) / 255.0
+        self.state['tgt_fg_tensor'] = torch.from_numpy(core_arr)[None, None].to(
             device=self.device, dtype=self.dtype
         )
 
@@ -620,7 +618,6 @@ class FastMultiViewMasaCtrlInpainter:
             np.stack([(np.array(m, dtype=np.uint8) > 127).astype(np.float32) for m in aug_masks], axis=0)
         )[:, None].to(device=self.device, dtype=self.dtype)  # [N, 1, H, W]
 
-        # Encode all views in chunks to keep peak VRAM low
         latent_chunks = []
         for start in range(0, n_views, self.batch_chunk_size):
             end = min(start + self.batch_chunk_size, n_views)
@@ -638,7 +635,6 @@ class FastMultiViewMasaCtrlInpainter:
             dtype=self.dtype,
         )
 
-        # Mutable container for active views (pruned after switch_step)
         active = {
             'latents': ref_latents,
             'unet_masks': ref_unet_masks,
@@ -663,8 +659,25 @@ class FastMultiViewMasaCtrlInpainter:
                 raise ValueError('style_fidelity must be between 0.0 and 1.0')
             return val
 
+        def resolve_bg_suppress_bias(step_idx: int) -> float:
+            val = (
+                float(bg_suppress_bias(step_idx, len(timesteps)))
+                if callable(bg_suppress_bias)
+                else float(bg_suppress_bias)
+            )
+            if val > 0.0:
+                raise ValueError('bg_suppress_bias must be <= 0.0')
+            return val
+
         def arm_step(step_idx: int) -> None:
-            if step_idx < switch_step or step_idx >= len(timesteps):
+            if step_idx >= len(timesteps):
+                self.state['mode'] = 'noop'
+                self.state['record_view_scores'] = False
+                return
+
+            self.state['bg_suppress_bias'] = resolve_bg_suppress_bias(step_idx)
+
+            if step_idx < switch_step:
                 self.state['mode'] = 'noop'
                 self.state['record_view_scores'] = False
                 return
@@ -715,7 +728,6 @@ class FastMultiViewMasaCtrlInpainter:
         arm_step(0)
 
         def step_callback(pipe_obj, step_index, timestep, callback_kwargs):
-            # Prune candidate bank down to top_k_views right after switch_step completes
             if step_index == switch_step and self.state['view_scores']:
                 avg_scores = torch.stack(self.state['view_scores'], dim=0).mean(dim=0)
                 k_keep = min(max(1, int(top_k_views)), active['count'])
@@ -751,7 +763,7 @@ class FastMultiViewMasaCtrlInpainter:
             self.state['bank'].clear()
             self.state['bank_chunks'].clear()
             self.state['view_scores'].clear()
-            self.state['iso_bias_cache'].clear()
+            self.state['iso_weight_cache'].clear()
             self.state['record_view_scores'] = False
             self.state['write_fg_masks'] = None
 
@@ -770,31 +782,37 @@ if __name__ == '__main__':
     )
 
     init_img = Image.open('assets/src.jpg')
-    inpaint_msk = Image.open('assets/mask_rect.jpg')
+    inpaint_msk = Image.open('assets/mask_rect.jpg').filter(ImageFilter.MaxFilter(25))
     ref_imgs = [Image.open('references/1.jpeg')]
     ref_msks = [Image.open('references/1_mask.png')]
 
-    # Optional: pass blurred mask to inpaint_mask and tight mask to attn_mask
-    # blended_msk = inpaint_msk.filter(ImageFilter.MaxFilter(25)).filter(ImageFilter.GaussianBlur(45))
+    # Optional: light feather on attn_mask softens the boundary rim in attention space
+    attn_msk = inpaint_msk.filter(ImageFilter.GaussianBlur(3))
+
+    blured_mask = inpaint_msk.filter(ImageFilter.MaxFilter(25)).filter(ImageFilter.GaussianBlur(45))
 
     def fidelity_func(s: int, n: int) -> float:
         return float(np.linspace(0.0, 0.5, n)[s])
 
+    def bias_func(s: int, n: int) -> float:
+        # Hard isolation early (-12.0), relaxing to soft boundary blending (-2.5) late
+        return float(np.linspace(-12.0, -2.5, n)[s])
+
     t0 = time.perf_counter()
     output = inpainter.generate(
         init_image=init_img,
-        inpaint_mask=inpaint_msk,
-        attn_mask=inpaint_msk,
-        bg_suppress_bias=-10000.0,
+        inpaint_mask=blured_mask,
+        attn_mask=attn_msk,
+        bg_suppress_bias=bias_func,
         isolate_reference=True,
         reference_image=ref_imgs,
         reference_mask=ref_msks,
-        angles_deg=(0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
-        scales=(0.80, 1.00, 1.25),
-        top_k_views=5,
+        angles_deg=tuple(np.linspace(-15.0, 15.0, 8)),
+        scales=tuple(np.linspace(0.70, 1.3, 4)),
+        top_k_views=15,
         write_stride=2,
         num_inference_steps=35,
-        switch_step=7,
+        switch_step=1,
         guidance_scale=6.5,
         style_fidelity=fidelity_func,
         seed=2,
