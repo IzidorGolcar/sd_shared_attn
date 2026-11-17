@@ -215,7 +215,7 @@ class MasaCtrlInpainter:
     '''
     def __init__(
         self,
-        inpaint_model_id: str = 'sd-legacy/stable-diffusion-inpainting', # should use sd-legacy/stable-diffusion-v1-5
+        inpaint_model_id: str = 'sd-legacy/stable-diffusion-inpainting',
         device: str = 'cuda',
         hook_blocks: Tuple[str, ...] = ('up_blocks',),  # Decoder layers per MasaCtrl Sec. 4.1 & Fig. 12(b)
     ):
