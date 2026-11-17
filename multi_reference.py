@@ -164,7 +164,6 @@ def _get_isolation_bias(
         if write_masks is None:
             return None
 
-        # Use precomputed unit weights after switch_step pruning for O(1) slicing
         if state_dict.get('cache_write_weights', False):
             all_write_masks = state_dict.get('all_active_fg_tensors')
             write_slice = state_dict.get('write_slice')
@@ -424,7 +423,6 @@ class MultiViewMasaCtrlAttnProcessor(AttnProcessor2_0):
             )
             return f_obj.transpose(1, 2).reshape(1, seq_len, inner_dim), {'type': 'global', 'best_idx': 0}
 
-        # Reuse conditional branch's winning route during unconditional CFG pass
         if cached_route is not None:
             if cached_route['type'] == 'global':
                 best_idx = cached_route['best_idx']
@@ -493,7 +491,6 @@ class MultiViewMasaCtrlAttnProcessor(AttnProcessor2_0):
             route_info = {'type': 'global', 'best_idx': best_idx}
             return f_obj.transpose(1, 2).reshape(1, seq_len, inner_dim), route_info
 
-        # Aggregate token scores into [K, grid_size, grid_size] patch scores
         n_cells = grid_size * grid_size
         patch_scores = torch.zeros((k_views, n_cells), device=q_h.device, dtype=torch.float32)
         patch_counts = torch.zeros((1, n_cells), device=q_h.device, dtype=torch.float32)
@@ -504,7 +501,6 @@ class MultiViewMasaCtrlAttnProcessor(AttnProcessor2_0):
         )
         patch_scores = patch_scores / patch_counts.clamp(min=1.0)
 
-        # Spatially smooth patch scores across neighboring grid cells to prevent abrupt view jumps
         grid_2d = patch_scores.view(1, k_views, grid_size, grid_size)
         kernel = torch.ones((k_views, 1, 3, 3), device=q_h.device, dtype=torch.float32)
         kernel[:, :, 1, 1] = 4.0
@@ -683,12 +679,9 @@ class MultiViewMasaCtrlAttnProcessor(AttnProcessor2_0):
 
 class FastMultiViewMasaCtrlInpainter:
     '''
-    Accelerated zero-shot multi-reference SD 1.5 Inpainting pipeline using:
-      1. Closed-form forward noising q(z_t | z_0) instead of N-view DDIM inversion.
-      2. Two-stage funnel pruning (switch_step -> top_k_views, funnel_step -> funnel_top_k_views).
-      3. Vectorized einsum view scoring, cached write isolation biases, and cached KV projections.
-      4. Scheduled bi-directional foreground-isolated self-attention.
-      5. Global-to-local spatial patch routing across candidate reference views.
+    Accelerated zero-shot multi-reference SD 1.5 Inpainting pipeline with persistent
+    multi-view reference precomputation (set_references) so repeated generate() calls
+    across different target images, masks, prompts, or seeds perform zero UNet write passes.
     '''
     def __init__(
         self,
@@ -700,6 +693,7 @@ class FastMultiViewMasaCtrlInpainter:
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.dtype = torch.float16 if self.device.type == 'cuda' else torch.float32
         self.batch_chunk_size = batch_chunk_size
+        self.ref_cache: Optional[Dict[str, Any]] = None
 
         self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
             inpaint_model_id,
@@ -766,45 +760,39 @@ class FastMultiViewMasaCtrlInpainter:
             self.state['bank'][layer_name] = (full_comp, full_mask)
         self.state['bank_chunks'].clear()
 
-    @torch.no_grad()
-    def generate(
-        self,
-        init_image: Image.Image,
-        inpaint_mask: Image.Image,
-        reference_image: Union[Image.Image, List[Image.Image]],
-        reference_mask: Union[Image.Image, List[Image.Image]],
-        attn_mask: Optional[Image.Image] = None,
-        bg_suppress_bias: Union[float, Callable[[int, int], float]] = _default_bg_suppress_bias,
-        isolate_reference: bool = True,
-        prompt: str = 'extreme macro closeup photograph of a single human finger, shadows',
-        negative_prompt: str = '',
-        width: int = 512,
-        height: int = 512,
-        angles_deg: Tuple[float, ...] = (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
-        scales: Tuple[float, ...] = (0.80, 1.00, 1.25),
-        top_k_views: int = 12,
-        funnel_top_k_views: int = 4,
-        funnel_step: int = 10,
-        patch_grid_size: int = 2,
-        patch_start_step: int = 15,
-        write_stride: int = 2,
-        num_inference_steps: int = 35,
-        switch_step: int = 1,
-        guidance_scale: float = 6.5,
-        style_fidelity: Union[float, Callable[[int, int], float]] = _default_style_fidelity,
-        seed: int = 42,
-    ) -> Image.Image:
+    def clear_references(self) -> None:
+        '''Frees cached multi-view reference banks from CPU/GPU memory.'''
+        self.ref_cache = None
         self.state['bank'].clear()
         self.state['bank_chunks'].clear()
         self.state['proj_kv_cache'].clear()
-        self.state['view_scores'].clear()
-        self.state['iso_weight_cache'].clear()
         self.state['write_unit_weight_cache'].clear()
-        self.state['patch_grid_cache'].clear()
-        self.state['record_view_scores'] = False
-        self.state['use_patch_routing'] = False
-        self.state['cache_write_weights'] = False
-        self.state['patch_grid_size'] = max(1, int(patch_grid_size))
+        self.state['all_active_fg_tensors'] = None
+
+    @torch.no_grad()
+    def set_references(
+        self,
+        reference_image: Union[Image.Image, List[Image.Image]],
+        reference_mask: Union[Image.Image, List[Image.Image]],
+        angles_deg: Tuple[float, ...] = (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
+        scales: Tuple[float, ...] = (0.80, 1.00, 1.25),
+        width: int = 512,
+        height: int = 512,
+        num_inference_steps: int = 35,
+        switch_step: int = 1,
+        funnel_step: Optional[int] = 10,
+        write_stride: int = 2,
+        bg_suppress_bias: Union[float, Callable[[int, int], float]] = _default_bg_suppress_bias,
+        isolate_reference: bool = True,
+        ref_seed: int = 42,
+        cache_device: str = 'cpu',
+    ) -> None:
+        '''
+        Precomputes augmented views, VAE latents, and compacted foreground token banks
+        across all scheduled write steps so subsequent generate() calls perform zero UNet
+        write passes. Use cache_device='cpu' on 8GB GPUs to keep persistent VRAM usage at 0 MB.
+        '''
+        self.clear_references()
         self.state['isolate_reference'] = bool(isolate_reference)
 
         ref_images = [reference_image] if isinstance(reference_image, Image.Image) else list(reference_image)
@@ -812,24 +800,10 @@ class FastMultiViewMasaCtrlInpainter:
         if len(ref_images) != len(ref_masks) or len(ref_images) == 0:
             raise ValueError('reference_image and reference_mask must be non-empty and have matching lengths')
 
-        # 1. Prepare target image, blending mask, and foreground attention mask
-        init_img = init_image.convert('RGB').resize((width, height), Image.LANCZOS)
-        tgt_mask_arr = np.array(
-            inpaint_mask.convert('L').resize((width, height), Image.BILINEAR), dtype=np.float32
-        )
-        if tgt_mask_arr.max() > 0.0 and tgt_mask_arr.max() < 200.0:
-            tgt_mask_arr = np.clip((tgt_mask_arr / tgt_mask_arr.max()) * 255.0, 0.0, 255.0)
-        tgt_mask_img = Image.fromarray(tgt_mask_arr.astype(np.uint8), mode='L')
+        storage_dev = torch.device(cache_device)
+        use_pinned = (storage_dev.type == 'cpu') and (self.device.type == 'cuda')
 
-        core_mask_src = attn_mask if attn_mask is not None else inpaint_mask
-        core_arr = np.array(
-            core_mask_src.convert('L').resize((width, height), Image.BILINEAR), dtype=np.float32
-        ) / 255.0
-        self.state['tgt_fg_tensor'] = torch.from_numpy(core_arr)[None, None].to(
-            device=self.device, dtype=self.dtype
-        )
-
-        # 2. Precompute rotation & scale augmented views across all reference images
+        # 1. Build rotation & scale augmented views across all reference images
         aug_images: List[Image.Image] = []
         aug_masks: List[Image.Image] = []
         for ref_img, ref_msk in zip(ref_images, ref_masks):
@@ -862,26 +836,17 @@ class FastMultiViewMasaCtrlInpainter:
             end = min(start + self.batch_chunk_size, n_views)
             lat = self.pipe.vae.encode(ref_tensors[start:end]).latent_dist.mean
             latent_chunks.append((lat * self.pipe.vae.config.scaling_factor).to(dtype=self.dtype))
-        ref_latents = torch.cat(latent_chunks, dim=0)  # [N, 4, H//8, W//8]
+        ref_latents = torch.cat(latent_chunks, dim=0)
         ref_unet_masks = F.interpolate(ref_fg_tensors, size=(height // 8, width // 8), mode='nearest')
 
-        # 3. Shared deterministic noise for closed-form q(z_t | z_0) forward trajectory
-        noise_gen = torch.Generator(device=self.device).manual_seed(seed)
+        # 2. Deterministic noise trajectory for closed-form forward noising q(z_t | z_0)
+        noise_gen = torch.Generator(device=self.device).manual_seed(ref_seed)
         base_noise = torch.randn(
             (1, ref_latents.shape[1], ref_latents.shape[2], ref_latents.shape[3]),
             generator=noise_gen,
             device=self.device,
             dtype=self.dtype,
         )
-
-        active = {
-            'latents': ref_latents,
-            'unet_masks': ref_unet_masks,
-            'fg_tensors': ref_fg_tensors,
-            'count': n_views,
-            'force_write': False,
-        }
-        self.state['all_active_fg_tensors'] = ref_fg_tensors
 
         null_embed, _ = self.pipe.encode_prompt(
             prompt='',
@@ -893,8 +858,195 @@ class FastMultiViewMasaCtrlInpainter:
         self.pipe.scheduler.set_timesteps(num_inference_steps, device=self.device)
         timesteps = self.pipe.scheduler.timesteps
         stride = max(1, int(write_stride))
+
+        write_steps_set = set(range(int(switch_step), len(timesteps), stride))
+        if funnel_step is not None and int(switch_step) < int(funnel_step) < len(timesteps):
+            write_steps_set.add(int(funnel_step))
+        write_steps = sorted(write_steps_set)
+
+        # Cache reference isolation weights across steps if view count is modest
+        self.state['all_active_fg_tensors'] = ref_fg_tensors
+        self.state['cache_write_weights'] = n_views <= 24
+
+        step_banks: Dict[int, Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = {}
+
+        try:
+            for step_idx in write_steps:
+                bias_val = (
+                    float(bg_suppress_bias(step_idx, len(timesteps)))
+                    if callable(bg_suppress_bias)
+                    else float(bg_suppress_bias)
+                )
+                if bias_val > 0.0:
+                    raise ValueError('bg_suppress_bias must be <= 0.0')
+                self.state['bg_suppress_bias'] = bias_val
+                self.state['bank_chunks'].clear()
+
+                t = timesteps[step_idx]
+                self.state['mode'] = 'write'
+                for start in range(0, n_views, self.batch_chunk_size):
+                    end = min(start + self.batch_chunk_size, n_views)
+                    b_chunk = end - start
+
+                    self.state['write_fg_masks'] = ref_fg_tensors[start:end]
+                    self.state['write_slice'] = (start, end)
+                    z_ref_t = self.pipe.scheduler.add_noise(
+                        ref_latents[start:end],
+                        base_noise.expand(b_chunk, -1, -1, -1),
+                        t.expand(b_chunk),
+                    )
+                    z_scaled = self.pipe.scheduler.scale_model_input(z_ref_t, t)
+                    unet_in = torch.cat(
+                        [z_scaled, ref_unet_masks[start:end], ref_latents[start:end]], dim=1
+                    )
+                    self.pipe.unet(
+                        unet_in,
+                        t,
+                        encoder_hidden_states=null_embed.expand(b_chunk, -1, -1),
+                        return_dict=False,
+                    )
+
+                self.state['write_fg_masks'] = None
+                self.state['write_slice'] = None
+                self._finalize_step_bank()
+
+                layer_dict: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+                for layer_name, (comp, valid) in self.state['bank'].items():
+                    comp_out = comp.to(device=storage_dev)
+                    valid_out = valid.to(device=storage_dev)
+                    if use_pinned:
+                        comp_out = comp_out.pin_memory()
+                        valid_out = valid_out.pin_memory()
+                    layer_dict[layer_name] = (comp_out, valid_out)
+                step_banks[step_idx] = layer_dict
+
+            self.ref_cache = {
+                'n_views': n_views,
+                'width': width,
+                'height': height,
+                'num_inference_steps': num_inference_steps,
+                'switch_step': int(switch_step),
+                'funnel_step': None if funnel_step is None else int(funnel_step),
+                'write_stride': stride,
+                'isolate_reference': bool(isolate_reference),
+                'step_banks': step_banks,
+            }
+        finally:
+            self.state['mode'] = 'noop'
+            self.state['bank'].clear()
+            self.state['bank_chunks'].clear()
+            self.state['proj_kv_cache'].clear()
+            self.state['write_unit_weight_cache'].clear()
+            self.state['cache_write_weights'] = False
+            self.state['all_active_fg_tensors'] = None
+            self.state['write_fg_masks'] = None
+            self.state['write_slice'] = None
+
+    @torch.no_grad()
+    def generate(
+        self,
+        init_image: Image.Image,
+        inpaint_mask: Image.Image,
+        reference_image: Optional[Union[Image.Image, List[Image.Image]]] = None,
+        reference_mask: Optional[Union[Image.Image, List[Image.Image]]] = None,
+        attn_mask: Optional[Image.Image] = None,
+        bg_suppress_bias: Union[float, Callable[[int, int], float]] = _default_bg_suppress_bias,
+        isolate_reference: bool = True,
+        prompt: str = 'extreme macro closeup photograph of a single human finger, shadows',
+        negative_prompt: str = '',
+        width: int = 512,
+        height: int = 512,
+        angles_deg: Tuple[float, ...] = (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
+        scales: Tuple[float, ...] = (0.80, 1.00, 1.25),
+        top_k_views: int = 12,
+        funnel_top_k_views: int = 4,
+        funnel_step: Optional[int] = 10,
+        patch_grid_size: int = 2,
+        patch_start_step: int = 15,
+        write_stride: int = 2,
+        num_inference_steps: int = 35,
+        switch_step: int = 1,
+        guidance_scale: float = 6.5,
+        style_fidelity: Union[float, Callable[[int, int], float]] = _default_style_fidelity,
+        seed: int = 42,
+        ref_seed: Optional[int] = None,
+        cache_device: str = 'cpu',
+    ) -> Image.Image:
+        # Build reference cache on demand if reference_image was passed directly
+        if reference_image is not None:
+            if reference_mask is None:
+                raise ValueError('reference_mask must be provided when reference_image is passed')
+            self.set_references(
+                reference_image=reference_image,
+                reference_mask=reference_mask,
+                angles_deg=angles_deg,
+                scales=scales,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                switch_step=switch_step,
+                funnel_step=funnel_step,
+                write_stride=write_stride,
+                bg_suppress_bias=bg_suppress_bias,
+                isolate_reference=isolate_reference,
+                ref_seed=seed if ref_seed is None else ref_seed,
+                cache_device=cache_device,
+            )
+
+        if self.ref_cache is None:
+            raise RuntimeError('No references cached. Call set_references() first or pass reference_image/reference_mask.')
+
+        if (self.ref_cache['width'], self.ref_cache['height']) != (width, height):
+            raise ValueError(
+                f'Cached references have resolution {(self.ref_cache["width"], self.ref_cache["height"])}, '
+                f'but generate() was called with {(width, height)}.'
+            )
+        if self.ref_cache['num_inference_steps'] != num_inference_steps:
+            raise ValueError(
+                f'Cached references were built for num_inference_steps={self.ref_cache["num_inference_steps"]}, '
+                f'but generate() was called with {num_inference_steps}.'
+            )
+
+        self.state['bank'].clear()
+        self.state['bank_chunks'].clear()
+        self.state['proj_kv_cache'].clear()
+        self.state['view_scores'].clear()
+        self.state['iso_weight_cache'].clear()
+        self.state['patch_grid_cache'].clear()
+        self.state['record_view_scores'] = False
+        self.state['use_patch_routing'] = False
+        self.state['patch_grid_size'] = max(1, int(patch_grid_size))
+
+        # 1. Prepare target image, blending mask, and foreground attention mask
+        init_img = init_image.convert('RGB').resize((width, height), Image.LANCZOS)
+        tgt_mask_arr = np.array(
+            inpaint_mask.convert('L').resize((width, height), Image.BILINEAR), dtype=np.float32
+        )
+        if tgt_mask_arr.max() > 0.0 and tgt_mask_arr.max() < 200.0:
+            tgt_mask_arr = np.clip((tgt_mask_arr / tgt_mask_arr.max()) * 255.0, 0.0, 255.0)
+        tgt_mask_img = Image.fromarray(tgt_mask_arr.astype(np.uint8), mode='L')
+
+        core_mask_src = attn_mask if attn_mask is not None else inpaint_mask
+        core_arr = np.array(
+            core_mask_src.convert('L').resize((width, height), Image.BILINEAR), dtype=np.float32
+        ) / 255.0
+        self.state['tgt_fg_tensor'] = torch.from_numpy(core_arr)[None, None].to(
+            device=self.device, dtype=self.dtype
+        )
+
+        self.pipe.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        timesteps = self.pipe.scheduler.timesteps
+
+        step_banks = self.ref_cache['step_banks']
+        n_views = self.ref_cache['n_views']
+        active = {
+            'indices': None,  # None means all [0..n_views-1]; otherwise 1D LongTensor on storage_dev
+            'count': n_views,
+        }
+
         enable_funnel = (
             funnel_top_k_views is not None
+            and funnel_step is not None
             and 1 <= int(funnel_top_k_views) < int(top_k_views)
             and int(funnel_step) > int(switch_step)
         )
@@ -915,6 +1067,22 @@ class FastMultiViewMasaCtrlInpainter:
                 raise ValueError('bg_suppress_bias must be <= 0.0')
             return val
 
+        def load_cached_step_bank(step_idx: int) -> None:
+            self.state['bank'].clear()
+            self.state['proj_kv_cache'].clear()
+            idx_cpu = active['indices']
+            for layer_name, (comp_src, valid_src) in step_banks[step_idx].items():
+                if idx_cpu is not None:
+                    comp_sub = comp_src[idx_cpu]
+                    valid_sub = valid_src[idx_cpu]
+                else:
+                    comp_sub = comp_src
+                    valid_sub = valid_src
+
+                comp_gpu = comp_sub.to(device=self.device, dtype=self.dtype, non_blocking=True)
+                valid_gpu = valid_sub.to(device=self.device, non_blocking=True)
+                self.state['bank'][layer_name] = (comp_gpu, valid_gpu)
+
         def prune_active_views(k_target: int) -> None:
             if not self.state['view_scores']:
                 return
@@ -924,16 +1092,20 @@ class FastMultiViewMasaCtrlInpainter:
                 self.state['view_scores'].clear()
                 return
 
-            top_idx = torch.topk(avg_scores, k=k_keep, largest=True).indices
-            active['latents'] = active['latents'][top_idx]
-            active['unet_masks'] = active['unet_masks'][top_idx]
-            active['fg_tensors'] = active['fg_tensors'][top_idx]
-            active['count'] = k_keep
-            active['force_write'] = True
+            top_local = torch.topk(avg_scores, k=k_keep, largest=True).indices
+            top_local_cpu = top_local.to('cpu')
 
-            self.state['all_active_fg_tensors'] = active['fg_tensors']
-            self.state['write_unit_weight_cache'].clear()
+            if active['indices'] is None:
+                active['indices'] = top_local_cpu
+            else:
+                active['indices'] = active['indices'][top_local_cpu]
+            active['count'] = k_keep
+
+            # Immediately prune the live GPU bank so the very next step uses only k_keep views
             self.state['proj_kv_cache'].clear()
+            for layer_name, (comp_gpu, valid_gpu) in list(self.state['bank'].items()):
+                self.state['bank'][layer_name] = (comp_gpu[top_local], valid_gpu[top_local])
+
             self.state['view_scores'].clear()
 
         def arm_step(step_idx: int) -> None:
@@ -958,15 +1130,9 @@ class FastMultiViewMasaCtrlInpainter:
 
             is_switch_step = step_idx == switch_step
             is_funnel_step = enable_funnel and (step_idx == int(funnel_step))
-            need_write = (
-                is_switch_step
-                or active['force_write']
-                or ((step_idx - switch_step) % stride == 0)
-            )
-            active['force_write'] = False
 
-            # Enable cached write masks once initial N-view pool is pruned to <= 16 views
-            self.state['cache_write_weights'] = (not is_switch_step) and (active['count'] <= 16)
+            if step_idx in step_banks:
+                load_cached_step_bank(step_idx)
 
             should_record = (
                 (is_switch_step and active['count'] > top_k_views)
@@ -975,41 +1141,6 @@ class FastMultiViewMasaCtrlInpainter:
             self.state['record_view_scores'] = should_record
             if should_record:
                 self.state['view_scores'].clear()
-
-            if need_write:
-                self.state['bank_chunks'].clear()
-                t = timesteps[step_idx]
-                cur_n = active['count']
-                cur_latents = active['latents']
-                cur_unet_masks = active['unet_masks']
-                cur_fg_tensors = active['fg_tensors']
-
-                self.state['mode'] = 'write'
-                for start in range(0, cur_n, self.batch_chunk_size):
-                    end = min(start + self.batch_chunk_size, cur_n)
-                    b_chunk = end - start
-
-                    self.state['write_fg_masks'] = cur_fg_tensors[start:end]
-                    self.state['write_slice'] = (start, end)
-                    z_ref_t = self.pipe.scheduler.add_noise(
-                        cur_latents[start:end],
-                        base_noise.expand(b_chunk, -1, -1, -1),
-                        t.expand(b_chunk),
-                    )
-                    z_scaled = self.pipe.scheduler.scale_model_input(z_ref_t, t)
-                    unet_in = torch.cat(
-                        [z_scaled, cur_unet_masks[start:end], cur_latents[start:end]], dim=1
-                    )
-                    self.pipe.unet(
-                        unet_in,
-                        t,
-                        encoder_hidden_states=null_embed.expand(b_chunk, -1, -1),
-                        return_dict=False,
-                    )
-
-                self.state['write_fg_masks'] = None
-                self.state['write_slice'] = None
-                self._finalize_step_bank()
 
             self.state['mode'] = 'read'
 
@@ -1047,14 +1178,9 @@ class FastMultiViewMasaCtrlInpainter:
             self.state['proj_kv_cache'].clear()
             self.state['view_scores'].clear()
             self.state['iso_weight_cache'].clear()
-            self.state['write_unit_weight_cache'].clear()
             self.state['patch_grid_cache'].clear()
             self.state['record_view_scores'] = False
             self.state['use_patch_routing'] = False
-            self.state['cache_write_weights'] = False
-            self.state['all_active_fg_tensors'] = None
-            self.state['write_fg_masks'] = None
-            self.state['write_slice'] = None
 
         return result
 
@@ -1070,13 +1196,8 @@ if __name__ == '__main__':
         batch_chunk_size=8,
     )
 
-    init_img = Image.open('assets/src.jpg')
-    inpaint_msk = Image.open('assets/mask_rect.jpg').filter(ImageFilter.MaxFilter(25))
     ref_imgs = [Image.open('references/1.jpeg')]
     ref_msks = [Image.open('references/1_mask.png')]
-
-    attn_msk = inpaint_msk.filter(ImageFilter.GaussianBlur(3))
-    blured_mask = inpaint_msk.filter(ImageFilter.MaxFilter(25)).filter(ImageFilter.GaussianBlur(45))
 
     def fidelity_func(s: int, n: int) -> float:
         return float(np.linspace(0.0, 0.5, n)[s])
@@ -1084,31 +1205,51 @@ if __name__ == '__main__':
     def bias_func(s: int, n: int) -> float:
         return float(np.linspace(-12.0, -2.5, n)[s])
 
-    t0 = time.perf_counter()
-    output = inpainter.generate(
-        init_image=init_img,
-        inpaint_mask=blured_mask,
-        attn_mask=attn_msk,
-        bg_suppress_bias=bias_func,
-        isolate_reference=True,
+    # 1. Precompute all multi-view reference banks once (stored in pinned CPU RAM)
+    t_ref = time.perf_counter()
+    inpainter.set_references(
         reference_image=ref_imgs,
         reference_mask=ref_msks,
         angles_deg=tuple(np.linspace(-15.0, 15.0, 8)),
         scales=tuple(np.linspace(0.70, 1.3, 4)),
-        top_k_views=15,
-        funnel_top_k_views=4,
-        funnel_step=10,
-        patch_grid_size=2,
-        patch_start_step=15,
-        write_stride=2,
+        width=512,
+        height=512,
         num_inference_steps=35,
         switch_step=1,
-        guidance_scale=6.5,
-        style_fidelity=fidelity_func,
-        seed=2,
+        funnel_step=10,
+        write_stride=2,
+        bg_suppress_bias=bias_func,
+        isolate_reference=True,
+        ref_seed=2,
+        cache_device='cpu',
     )
-    elapsed = time.perf_counter() - t0
-    print(f'Generated in {elapsed:.2f}s')
+    print(f'References precomputed in {time.perf_counter() - t_ref:.2f}s')
+
+    # 2. Run fast generation across any number of target images, masks, or seeds
+    init_img = Image.open('assets/src.jpg')
+    inpaint_msk = Image.open('assets/mask_rect.jpg').filter(ImageFilter.MaxFilter(25))
+    attn_msk = inpaint_msk.filter(ImageFilter.GaussianBlur(3))
+    blured_mask = inpaint_msk.filter(ImageFilter.MaxFilter(25)).filter(ImageFilter.GaussianBlur(45))
+
+    for target_seed in (2, 7, 19):
+        t0 = time.perf_counter()
+        output = inpainter.generate(
+            init_image=init_img,
+            inpaint_mask=blured_mask,
+            attn_mask=attn_msk,
+            bg_suppress_bias=bias_func,
+            top_k_views=15,
+            funnel_top_k_views=4,
+            funnel_step=10,
+            patch_grid_size=2,
+            patch_start_step=15,
+            num_inference_steps=35,
+            switch_step=1,
+            guidance_scale=6.5,
+            style_fidelity=fidelity_func,
+            seed=target_seed,
+        )
+        print(f'[seed={target_seed}] Generated in {time.perf_counter() - t0:.2f}s')
 
     output.save('output_fast_multiview_masactrl_sd15.png')
     plt.imshow(output)
