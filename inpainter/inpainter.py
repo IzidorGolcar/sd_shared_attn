@@ -103,8 +103,8 @@ class FastMultiViewMasaCtrlInpainter:
         self,
         reference_image: Union[Image.Image, List[Image.Image]],
         reference_mask: Union[Image.Image, List[Image.Image]],
-        angles_deg: Tuple[float, ...] = (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
-        scales: Tuple[float, ...] = (0.80, 1.00, 1.25),
+        angles_deg: Union[List[float], np.ndarray] = [0.0],
+        scales: Union[List[float], np.ndarray] = [1.0],
         width: int = 512,
         height: int = 512,
         num_inference_steps: int = 35,
@@ -320,6 +320,7 @@ class FastMultiViewMasaCtrlInpainter:
                 'highres_start_step': int(highres_start_step),
                 'write_stride': stride,
                 'isolate_reference': bool(isolate_reference),
+                'bg_suppress_bias': bg_suppress_bias,
                 'store': store,
             }
             return store.stats()
@@ -346,73 +347,26 @@ class FastMultiViewMasaCtrlInpainter:
         self,
         init_image: Image.Image,
         inpaint_mask: Image.Image,
-        reference_image: Optional[Union[Image.Image, List[Image.Image]]] = None,
-        reference_mask: Optional[Union[Image.Image, List[Image.Image]]] = None,
         attn_mask: Optional[Image.Image] = None,
-        bg_suppress_bias: Union[float, Callable[[int, int], float]] = _default_bg_suppress_bias,
-        isolate_reference: bool = True,
         prompt: str = 'extreme macro closeup photograph of a single human finger, shadows',
         negative_prompt: str = '',
-        width: int = 512,
-        height: int = 512,
-        angles_deg: Tuple[float, ...] = (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
-        scales: Tuple[float, ...] = (0.80, 1.00, 1.25),
         top_k_views: int = 12,
         funnel_top_k_views: int = 4,
-        funnel_step: Optional[int] = 10,
-        highres_start_step: int = 4,
         patch_grid_size: int = 2,
         patch_start_step: int = 15,
-        write_stride: int = 2,
-        num_inference_steps: int = 35,
-        switch_step: int = 1,
         guidance_scale: float = 6.5,
         style_fidelity: Union[float, Callable[[int, int], float]] = _default_style_fidelity,
         seed: int = 42,
-        ref_seed: Optional[int] = None,
-        max_pinned_gb: float = 2.0,
-        min_free_ram_gb: float = 4.0,
-        quantize_cache: bool = True,
-        cache_dir: Optional[str] = None,
     ) -> Image.Image:
-        # Build reference cache on demand if reference_image was passed directly
-        if reference_image is not None:
-            if reference_mask is None:
-                raise ValueError('reference_mask must be provided when reference_image is passed')
-            self.set_references(
-                reference_image=reference_image,
-                reference_mask=reference_mask,
-                angles_deg=angles_deg,
-                scales=scales,
-                width=width,
-                height=height,
-                num_inference_steps=num_inference_steps,
-                switch_step=switch_step,
-                funnel_step=funnel_step,
-                highres_start_step=highres_start_step,
-                write_stride=write_stride,
-                bg_suppress_bias=bg_suppress_bias,
-                isolate_reference=isolate_reference,
-                ref_seed=seed if ref_seed is None else ref_seed,
-                max_pinned_gb=max_pinned_gb,
-                min_free_ram_gb=min_free_ram_gb,
-                quantize_cache=quantize_cache,
-                cache_dir=cache_dir,
-            )
-
         if self.ref_cache is None:
-            raise RuntimeError('No references cached. Call set_references() first or pass reference_image/reference_mask.')
+            raise RuntimeError('No references cached. Call set_references() before generate().')
 
-        if (self.ref_cache['width'], self.ref_cache['height']) != (width, height):
-            raise ValueError(
-                f'Cached references have resolution {(self.ref_cache["width"], self.ref_cache["height"])}, '
-                f'but generate() was called with {(width, height)}.'
-            )
-        if self.ref_cache['num_inference_steps'] != num_inference_steps:
-            raise ValueError(
-                f'Cached references were built for num_inference_steps={self.ref_cache["num_inference_steps"]}, '
-                f'but generate() was called with {num_inference_steps}.'
-            )
+        width = int(self.ref_cache['width'])
+        height = int(self.ref_cache['height'])
+        num_inference_steps = int(self.ref_cache['num_inference_steps'])
+        switch_step = int(self.ref_cache['switch_step'])
+        funnel_step = self.ref_cache['funnel_step']
+        bg_suppress_bias = self.ref_cache['bg_suppress_bias']
 
         self.state['bank'].clear()
         self.state['bank_chunks'].clear()

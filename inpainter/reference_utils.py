@@ -2,7 +2,7 @@
 import gc
 import math
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 import numpy as np
 import torch
@@ -67,8 +67,8 @@ def _build_augmented_views(
     reference_mask: Image.Image,
     width: int,
     height: int,
-    angles_deg: Tuple[float, ...],
-    scales: Tuple[float, ...],
+    angles_deg: Union[List[float], np.ndarray],
+    scales: Union[List[float], np.ndarray],
 ) -> Tuple[List[Image.Image], List[Image.Image]]:
     '''
     Precomputes rotation- and scale-augmented reference views centered on the
@@ -145,5 +145,4 @@ def extract_foreground_tokens_ragged(
         views.append(hidden_states[i, idx].contiguous())
 
     return views
-
 
